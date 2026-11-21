@@ -30,11 +30,16 @@ struct Columns {
     void add(const char* name, const std::vector<Row>& rows, Value Row::*member, bool nullable=false) {
         Builder builder;
         checked(builder.Reserve(rows.size()));
+        if constexpr (std::is_same_v<Value, Text>) {
+            int64_t bytes=0;
+            for (auto& row:rows) bytes+=(row.*member).size();
+            checked(builder.ReserveData(bytes));
+        }
         for (auto& row : rows) {
             if constexpr (std::is_same_v<Value, Text>) {
-                if (nullable && (row.*member).data() == nullptr) checked(builder.AppendNull());
-                else checked(builder.Append(row.*member));
-            } else checked(builder.Append(row.*member));
+                if (nullable && (row.*member).data() == nullptr) builder.UnsafeAppendNull();
+                else builder.UnsafeAppend(row.*member);
+            } else builder.UnsafeAppend(row.*member);
         }
         arrays.push_back(builder.Finish().ValueOrDie());
         fields.push_back(arrow::field(name, arrays.back()->type(), nullable));
@@ -42,7 +47,8 @@ struct Columns {
     void save(const std::filesystem::path& path) {
         auto sink = arrow::io::FileOutputStream::Open(path.string()).ValueOrDie();
         auto table = arrow::Table::Make(arrow::schema(fields), arrays);
-        checked(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, 65536));
+        static const auto props=parquet::WriterProperties::Builder().disable_statistics()->build();
+        checked(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, 65536, props));
         checked(sink->Close());
     }
 };
