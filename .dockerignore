@@ -1,0 +1,6 @@
+*
+!native/
+native/*
+!native/pipeline.cpp
+!native/output.hpp
+!Dockerfile

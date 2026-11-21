@@ -1,0 +1,9 @@
+/*
+!/.gitignore
+!/.dockerignore
+!/Dockerfile
+!/README.md
+!/native/
+/native/*
+!/native/pipeline.cpp
+!/native/output.hpp
