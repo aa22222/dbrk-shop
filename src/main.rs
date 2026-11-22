@@ -129,7 +129,7 @@ fn estimate(chunk: &[u8]) -> usize {
         return 0;
     }
     let rows = memchr::memchr_iter(b'\n', &chunk[..n]).count();
-    (rows * chunk.len().min(512 * 1024) / n / BINS) * 5 / 4 + 2
+    (rows * chunk.len().min(input::CHUNK_BYTES) / n / BINS) * 5 / 4 + 2
 }
 
 fn dedup<D: EventValues>(chunks: Vec<Vec<Record<D>>>, links: &IdMap<0>) -> Bins<Event<D>> {

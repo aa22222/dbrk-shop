@@ -2,6 +2,8 @@ use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
 use std::{fs, io, path::Path};
 
+pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
 pub struct Files(Vec<Mmap>);
 
 impl Files {
@@ -25,14 +27,13 @@ impl Files {
     }
 
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        const BYTES: usize = 512 * 1024;
         let mut out = Vec::new();
         for file in &self.0 {
-            for start in (0..file.len()).step_by(BYTES) {
+            for start in (0..file.len()).step_by(CHUNK_BYTES) {
                 out.push(Chunk {
                     file,
                     start,
-                    end: (start + BYTES).min(file.len()),
+                    end: (start + CHUNK_BYTES).min(file.len()),
                 });
             }
         }
