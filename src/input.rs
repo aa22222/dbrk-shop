@@ -186,6 +186,56 @@ pub fn price(s: &[u8]) -> Option<u32> {
         .map(|x| x as u32)
 }
 
+// Most numeric timestamps have thirteen digits. Decode two overlapping
+// eight-byte loads without reading beyond the field, including at EOF.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn epoch13(s: &[u8; 13]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let first = i64::from_le_bytes(s[..8].try_into().unwrap());
+    let last = i64::from_le_bytes(s[5..].try_into().unwrap());
+    unsafe {
+        let bytes = _mm_set_epi64x(last, first);
+        let digits = _mm_sub_epi8(bytes, _mm_set1_epi8(b'0' as i8));
+        let invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if _mm_testz_si128(invalid, invalid) == 0 {
+            return None;
+        }
+        let positions = _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15);
+        let padded = _mm_shuffle_epi8(digits, positions);
+        let pairs = _mm_maddubs_epi16(padded, _mm_set1_epi16(0x010a));
+        let groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        let group = |x: i32| i64::from(x);
+        let high =
+            group(_mm_extract_epi32::<0>(groups)) * 10_000 + group(_mm_extract_epi32::<1>(groups));
+        let low =
+            group(_mm_extract_epi32::<2>(groups)) * 10_000 + group(_mm_extract_epi32::<3>(groups));
+        Some(high * 100_000_000 + low)
+    }
+}
+
+#[inline]
+fn seconds_in_day<const VALIDATE: bool>(clock: &[u8]) -> Option<i64> {
+    let word = u64::from_le_bytes(clock.try_into().unwrap());
+    if VALIDATE {
+        // Check both separators and the high nibble of all six ASCII digits.
+        if (word ^ 0x3030_3a30_303a_3030) & 0xf0f0_fff0_f0ff_f0f0 != 0 {
+            return None;
+        }
+        let low = word & 0x0f0f_000f_0f00_0f0f;
+        if (low + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 != 0 {
+            return None;
+        }
+    }
+    const TENS: u64 = 0x000f_0000_0f00_000f;
+    let pairs = (word & TENS) * 10 + ((word >> 8) & TENS);
+    let (hour, minute, second) = (pairs & 255, (pairs >> 24) & 255, pairs >> 48);
+    if VALIDATE && (hour >= 24 || minute >= 60 || second >= 60) {
+        return None;
+    }
+    Some(((hour * 60 + minute) * 60 + second) as i64)
+}
+
 fn civil_year(y: i64, m: i64, d: i64) -> Option<i64> {
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
     let max = match m {
@@ -237,24 +287,20 @@ impl Dates {
         if s.len() != 20 {
             return None;
         }
-        let pair = |pos: usize| (s[pos] as i64 - 48) * 10 + s[pos + 1] as i64 - 48;
-        Some(self.day(s)? + ((pair(11) * 60 + pair(14)) * 60 + pair(17)) * 1000)
+        Some(self.day(s)? + seconds_in_day::<false>(&s[11..19])? * 1000)
     }
     pub fn time(&mut self, s: &[u8]) -> Option<i64> {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if let Ok(fixed) = s.try_into() {
+            return epoch13(fixed);
+        }
         if !matches!(s.len(), 20 | 25) || s[4] != b'-' {
             return digits(s);
         }
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        if s[10] != b'T' {
             return None;
         }
-        let (h, m, sec) = (
-            digits(&s[11..13])?,
-            digits(&s[14..16])?,
-            digits(&s[17..19])?,
-        );
-        if h >= 24 || m >= 60 || sec >= 60 {
-            return None;
-        }
+        let seconds = seconds_in_day::<true>(&s[11..19])?;
         let offset = if s.len() == 20 {
             if s[19] != b'Z' {
                 return None;
@@ -271,6 +317,6 @@ impl Dates {
                 _ => return None,
             }
         };
-        Some(self.day(s)? + ((h * 60 + m - offset) * 60 + sec) * 1000)
+        Some(self.day(s)? + (seconds - offset * 60) * 1000)
     }
 }
