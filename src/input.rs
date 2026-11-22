@@ -321,3 +321,41 @@ impl Dates {
         Some(self.day(s)? + (seconds - offset * 60) * 1000)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_decoder_matches_checked_decimal_for_each_byte_position() {
+        let mut dates = Dates::new();
+        for template in [*b"1791071890000", *b"0000000000000", *b"9999999999999"] {
+            for i in 0..template.len() {
+                for byte in 0..=255 {
+                    let mut field = template;
+                    field[i] = byte;
+                    assert_eq!(dates.time(&field), digits(&field), "{field:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_clock_matches_calendar_limits_and_ascii_digit_rules() {
+        let template = *b"23:59:58";
+        for i in 0..template.len() {
+            for byte in 0..=255 {
+                let mut field = template;
+                field[i] = byte;
+                let expected = (|| {
+                    let h = digits(&field[..2])?;
+                    let m = digits(&field[3..5])?;
+                    let s = digits(&field[6..])?;
+                    (field[2] == b':' && field[5] == b':' && h < 24 && m < 60 && s < 60)
+                        .then_some((h * 60 + m) * 60 + s)
+                })();
+                assert_eq!(seconds_in_day::<true>(&field), expected, "{field:?}");
+            }
+        }
+    }
+}
