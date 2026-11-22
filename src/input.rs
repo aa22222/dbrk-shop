@@ -2,7 +2,7 @@ use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
 use std::{fs, io, path::Path};
 
-pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
+pub const CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct Files(Vec<Mmap>);
 
