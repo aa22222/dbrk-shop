@@ -28,7 +28,7 @@ The official generator produced 20 million events and five million clicks with s
 
 | Input cache | Previous Rust (`e42788b`) | This version |
 | --- | ---: | ---: |
-| Warm | 1.038 s | 0.857 s |
-| Cold | 1.265 s | 1.018 s |
+| Warm | 1.189 s | 0.912 s |
+| Cold | 1.290 s | 1.114 s |
 
-Both output tables matched all 36 fixtures and the official 1M-event dev answers. The practice run matched every row of the validated reference output (2,240,907 user rows and 28,014 campaign rows). These timings were measured on the local Docker host.
+The optimized executable reached 2.86 GiB peak RSS on the practice input. Both output tables matched all 36 fixtures and the official 1M-event dev answers. The practice run matched every row of the validated reference output (2,240,907 user rows and 28,014 campaign rows). These timings were measured on the local Docker host.
