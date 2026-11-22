@@ -29,22 +29,67 @@ fn transpose<T>(chunks: Vec<Bins<T>>) -> Bins<Vec<T>> {
     }
     result
 }
+trait EventValues: Copy + Default + Send + Sync {
+    fn new(base: i64, t: i64, price: u32, category: u32) -> Self;
+    fn time(self, base: i64) -> i64;
+    fn price(self) -> u32;
+    fn category(self) -> u32;
+}
+
+// The compact format is selected once from the actual window and category
+// dictionary. A validated purchase price needs at most 24 bits.
 #[derive(Clone, Copy, Default)]
-struct EventData {
+struct CompactEvent {
+    millis: u32,
+    purchase: u32,
+}
+impl EventValues for CompactEvent {
+    fn new(base: i64, t: i64, price: u32, category: u32) -> Self {
+        Self {
+            millis: (t - base) as u32,
+            purchase: (category << 24) | price,
+        }
+    }
+    fn time(self, base: i64) -> i64 {
+        base + i64::from(self.millis)
+    }
+    fn price(self) -> u32 {
+        self.purchase & 0x00ff_ffff
+    }
+    fn category(self) -> u32 {
+        self.purchase >> 24
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct WideEvent {
     t: i64,
     price: u32,
     category: u32,
 }
-#[derive(Clone, Copy)]
-struct Event {
-    user: u64,
-    data: EventData,
+impl EventValues for WideEvent {
+    fn new(_: i64, t: i64, price: u32, category: u32) -> Self {
+        Self { t, price, category }
+    }
+    fn time(self, _: i64) -> i64 {
+        self.t
+    }
+    fn price(self) -> u32 {
+        self.price
+    }
+    fn category(self) -> u32 {
+        self.category
+    }
 }
 #[derive(Clone, Copy)]
-struct Record {
+struct Event<D> {
+    user: u64,
+    data: D,
+}
+#[derive(Clone, Copy)]
+struct Record<D> {
     id: u64,
     ingest: i64,
-    event: Event,
+    event: Event<D>,
 }
 #[derive(Clone, Copy, Default)]
 struct Ad<'a> {
@@ -87,7 +132,7 @@ fn estimate(chunk: &[u8]) -> usize {
     (rows * chunk.len().min(512 * 1024) / n / BINS) * 5 / 4 + 2
 }
 
-fn dedup(chunks: Vec<Vec<Record>>, links: &IdMap<0>) -> Bins<Event> {
+fn dedup<D: EventValues>(chunks: Vec<Vec<Record<D>>>, links: &IdMap<0>) -> Bins<Event<D>> {
     let n: usize = chunks.iter().map(Vec::len).sum();
     let fingerprint_bits = (n.max(16) * 4).next_power_of_two();
     let mut flags = vec![(0u64, 0u64); fingerprint_bits / 64];
@@ -109,9 +154,9 @@ fn dedup(chunks: Vec<Vec<Record>>, links: &IdMap<0>) -> Bins<Event> {
     // k rows in a repeated slot cause k-1 revisits, so k <= 2*(k-1).
     let capacity = (revisits * 3 + 1).next_power_of_two();
     let mut table = vec![u32::MAX; capacity];
-    let mut delayed = Vec::<Record>::with_capacity(2 * revisits);
+    let mut delayed = Vec::<Record<D>>::with_capacity(2 * revisits);
     let mut output = buckets((n / BINS) * 9 / 8);
-    let mut emit = |e: Event| {
+    let mut emit = |e: Event<D>| {
         if e.user != EMPTY {
             let user = links.find(e.user).unwrap_or(e.user);
             output[mix(user) % BINS].push(Event { user, data: e.data });
@@ -196,9 +241,10 @@ fn timeline<T, U: Copy + Default>(
 }
 
 type Days = FxHashMap<i32, Vec<Counts>>;
-fn aggregate(
+fn aggregate<D: EventValues>(
+    base: i64,
     bin: usize,
-    event_chunks: Vec<Vec<Event>>,
+    event_chunks: Vec<Vec<Event<D>>>,
     click_chunks: Vec<Vec<Click<'_>>>,
     users: &Symbols,
     categories: &[ByteArray],
@@ -238,13 +284,13 @@ fn aggregate(
         }
         let ev = &mut events.values[events.offsets[person]..events.offsets[person + 1]];
         let ad = &mut clicks.values[clicks.offsets[person]..clicks.offsets[person + 1]];
-        ev.sort_unstable_by_key(|e| e.t);
+        ev.sort_unstable_by_key(|e| e.time(base));
         ad.sort_unstable_by(|a, b| a.t.cmp(&b.t).then_with(|| b.id.cmp(a.id)));
         let (mut e, mut left, mut right) = (0, 0, 0);
         let mut last_day = None;
         let mut best = 0;
         while e < ev.len() {
-            let start = ev[e].t;
+            let start = ev[e].time(base);
             let day = start.div_euclid(DAY) as i32;
             if last_day != Some(day) {
                 output_rows.push(DayRow {
@@ -264,22 +310,22 @@ fn aggregate(
             let mut revenue = 0;
             loop {
                 let row = ev[e];
-                if row.price != 0 {
-                    let sum = &mut category_revenue[row.category as usize];
+                if row.price() != 0 {
+                    let sum = &mut category_revenue[row.category() as usize];
                     if *sum == 0 {
-                        touched.push(row.category);
+                        touched.push(row.category());
                     }
-                    *sum += row.price as i64;
-                    revenue += row.price as i64;
+                    *sum += row.price() as i64;
+                    revenue += row.price() as i64;
                     if *sum > best
-                        || (*sum == best && user.top.is_none_or(|cat| row.category < cat))
+                        || (*sum == best && user.top.is_none_or(|cat| row.category() < cat))
                     {
                         best = *sum;
-                        user.top = Some(row.category);
+                        user.top = Some(row.category());
                     }
                 }
                 e += 1;
-                if e == ev.len() || ev[e].t - row.t > 1_800_000 {
+                if e == ev.len() || ev[e].time(base) - row.time(base) > 1_800_000 {
                     break;
                 }
             }
@@ -336,7 +382,7 @@ fn aggregate(
 fn run(data: &Path, output: &Path) {
     let profile = env::var_os("SHOP_PROFILE").is_some();
     let mut last = Instant::now();
-    let mut mark = |name: &str| {
+    let mark = |name: &str| {
         if profile {
             eprintln!("{name} {:.4}s", last.elapsed().as_secs_f64());
             last = Instant::now();
@@ -382,6 +428,39 @@ fn run(data: &Path, output: &Path) {
             channel: ByteArray::from(channel.to_vec()),
         });
     });
+    let dims = Dimensions {
+        start,
+        end,
+        unknown,
+        product_map,
+        campaign_ids,
+        categories,
+        campaigns,
+    };
+    if end.abs_diff(start) <= u64::from(u32::MAX) && dims.categories.len() <= 256 {
+        process::<CompactEvent>(data, output, &dims, mark);
+    } else {
+        process::<WideEvent>(data, output, &dims, mark);
+    }
+}
+
+struct Dimensions<'a> {
+    start: i64,
+    end: i64,
+    unknown: u32,
+    product_map: FxHashMap<&'a [u8], u32>,
+    campaign_ids: FxHashMap<&'a [u8], u32>,
+    categories: Vec<ByteArray>,
+    campaigns: Vec<Campaign>,
+}
+
+fn process<D: EventValues>(
+    data: &Path,
+    output: &Path,
+    dims: &Dimensions,
+    mut mark: impl FnMut(&str),
+) {
+    let (start, end) = (dims.start, dims.end);
     let events = input::Files::open(&data.join("events")).unwrap();
     let links = input::Files::open(&data.join("links")).unwrap();
     let clicks = input::Files::open(&data.join("clicks")).unwrap();
@@ -423,14 +502,14 @@ fn run(data: &Path, output: &Path) {
                             let (price, category) = match kind {
                                 b"purchase" => (
                                     input::price(price)?,
-                                    *product_map.get(product).unwrap_or(&unknown),
+                                    *dims.product_map.get(product).unwrap_or(&dims.unknown),
                                 ),
                                 b"cart" | b"view" => (0, 0),
                                 _ => return None,
                             };
                             Some(Event {
                                 user: users.encode(uid),
-                                data: EventData { t, price, category },
+                                data: D::new(start, t, price, category),
                             })
                         })();
                         parts[mix(id) % BINS].push(Record {
@@ -438,7 +517,7 @@ fn run(data: &Path, output: &Path) {
                             ingest,
                             event: data.unwrap_or(Event {
                                 user: EMPTY,
-                                data: EventData::default(),
+                                data: D::default(),
                             }),
                         });
                     });
@@ -469,7 +548,7 @@ fn run(data: &Path, output: &Path) {
                         if id.is_empty() || user.is_empty() {
                             return;
                         }
-                        let Some(&campaign) = campaign_ids.get(campaign) else {
+                        let Some(&campaign) = dims.campaign_ids.get(campaign) else {
                             return;
                         };
                         let Some(t) = dates.time(ts) else {
@@ -500,12 +579,13 @@ fn run(data: &Path, output: &Path) {
         .enumerate()
         .map(|(i, (events, clicks))| {
             aggregate(
+                start,
                 i,
                 events,
                 clicks,
                 &users,
-                &categories,
-                campaigns.len(),
+                &dims.categories,
+                dims.campaigns.len(),
                 output,
             )
         })
@@ -515,7 +595,7 @@ fn run(data: &Path, output: &Path) {
         for (day, rows) in shard {
             let totals = all
                 .entry(day)
-                .or_insert_with(|| vec![Counts::default(); campaigns.len()]);
+                .or_insert_with(|| vec![Counts::default(); dims.campaigns.len()]);
             for (a, r) in totals.iter_mut().zip(rows) {
                 a.sessions += r.sessions;
                 a.purchasing += r.purchasing;
@@ -533,7 +613,11 @@ fn run(data: &Path, output: &Path) {
                 .map(move |(id, r)| (day, id, r))
         })
         .collect::<Vec<_>>();
-    output::campaigns(&output.join("campaign_daily/0.parquet"), &rows, &campaigns);
+    output::campaigns(
+        &output.join("campaign_daily/0.parquet"),
+        &rows,
+        &dims.campaigns,
+    );
     mark("group timelines, aggregate and write parquet");
 }
 fn main() {
