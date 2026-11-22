@@ -15,7 +15,7 @@
 #endif
 #include <mutex>
 #include <thread>
-#include <unordered_map>
+#include <map>
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -26,8 +26,9 @@
 namespace fs = std::filesystem;
 using namespace std::chrono;
 using std::vector;
-template<class V> using Dict = std::unordered_map<Text,V>;
+template<class V> using Dict = std::map<Text,V>;
 constexpr int bins = 64;
+constexpr size_t chunk_bytes = 8 * 1024 * 1024;
 constexpr I64 day_ms = 86400000, week = 7*day_ms, bad = INT64_MIN;
 int threads = 8;
 
@@ -258,14 +259,22 @@ I64 manifest_time(Text doc,Text key) {
 using Id = uint64_t;
 constexpr Id missing_id=UINT64_MAX;
 
-struct HashId {
-    size_t operator()(Id key) const {
-        key^=key>>32;
-        key*=0xd6e8feb86659fd93ULL;
-        return key^(key>>32);
-    }
-};
+// Use digit bits as a direct array address. All equality tests use the
+// original word, including the byte bits omitted from this address.
+Id digit_bits(Id word) {
+    word=std::rotr(word,16);
+#ifdef __BMI2__
+    return _pext_u64(word,0x1f1f1f1f1f1f1f1fULL);
+#else
+    Id address=0;
+    for (unsigned i=0;i<8;++i) address|=((word>>(8*i))&31)<<(5*i);
+    return address;
+#endif
+}
 
+Id person_digits(Id id) {
+    return id>>63 ? id/2 : digit_bits(id);
+}
 // Short prefixed IDs fit exactly in a word. All other byte strings use a
 // disjoint dictionary range; equality is exact in both representations.
 class Symbols {
@@ -288,7 +297,7 @@ public:
                 if (key<external) return key;
             }
         }
-        size_t b=std::hash<Text>{}(name)%bins;
+        size_t b=static_cast<unsigned char>(name.back())%bins;
         auto& pool=pools[b];
         std::lock_guard guard(pool.lock);
         auto [it,fresh]=pool.index.try_emplace(name,external+2*(b+bins*pool.names.size()));
@@ -307,39 +316,43 @@ public:
         return Text(storage.data(),1+(std::bit_width(key)+7)/8);
     }
 };
-// People already partitioned by hash use the remaining hash bits to probe.
-template<unsigned skip_bits> class IdTable {
-    struct Slot { Id key=missing_id,value=0; };
-    vector<Slot> slots;
-    size_t used=0;
-    size_t locate(Id key) const {
-        auto pos=(HashId{}(key)>>skip_bits) & (slots.size()-1);
-        while (slots[pos].key!=missing_id && slots[pos].key!=key)
-            pos=(pos+1)&(slots.size()-1);
-        return pos;
-    }
-public:
-    explicit IdTable(size_t estimate)
-        :slots(std::bit_ceil(std::max<size_t>(16,estimate*3/2))) {}
-    Id get_or_insert(Id key,Id initial) {
-        auto pos=locate(key);
-        if (slots[pos].key==key) return slots[pos].value;
-        if ((used+1)*4>slots.size()*3) {
-            auto old=std::move(slots);
-            slots.assign(old.size()*2,{});
-            for (auto entry:old) if (entry.key!=missing_id) slots[locate(entry.key)]=entry;
-            pos=locate(key);
+// Each radix bucket is one contiguous slice of exact, sorted IDs.
+struct FlatIds {
+    vector<Id> keys;
+    vector<unsigned> offsets;
+    unsigned skip;
+    explicit FlatIds(unsigned skip=0):skip(skip) {}
+    size_t bucket(Id key) const { return (person_digits(key)>>skip)&(offsets.size()-2); }
+    void build(vector<Id> input) {
+        size_t buckets=std::bit_ceil(std::max<size_t>(1,input.size()/2));
+        offsets.assign(buckets+1,0);
+        for (Id key:input) ++offsets[bucket(key)+1];
+        std::partial_sum(offsets.begin(),offsets.end(),offsets.begin());
+        auto next=offsets;
+        vector<Id> grouped(input.size());
+        for (Id key:input) grouped[next[bucket(key)]++]=key;
+        keys=std::move(input);
+        size_t used=0;
+        for (size_t b=0;b<buckets;++b) {
+            auto first=grouped.begin()+offsets[b],last=grouped.begin()+offsets[b+1];
+            std::sort(first,last);
+            last=std::unique(first,last);
+            offsets[b]=unsigned(used);
+            std::copy(first,last,keys.begin()+used);
+            used+=size_t(last-first);
         }
-        slots[pos]={key,initial};
-        ++used;
-        return initial;
+        offsets.back()=unsigned(used);
+        keys.resize(used);
     }
-    Id find(Id key,Id fallback) const {
-        const auto& slot=slots[locate(key)];
-        return slot.key==missing_id?fallback:slot.value;
-    }
-    template<class F> void transform_values(F transform) {
-        for (auto& entry:slots) if (entry.key!=missing_id) entry.value=transform(entry.value);
+    unsigned find(Id key) const {
+        size_t b=bucket(key);
+        auto first=keys.begin()+offsets[b],last=keys.begin()+offsets[b+1];
+        if (last-first<=8) {
+            for (auto it=first;it!=last;++it) if (*it==key) return unsigned(it-keys.begin());
+            return UINT32_MAX;
+        }
+        auto it=std::lower_bound(first,last,key);
+        return it!=last && *it==key ? unsigned(it-keys.begin()) : UINT32_MAX;
     }
 };
 // External symbol IDs are even. An odd value with the high bit set is
@@ -347,24 +360,18 @@ public:
 constexpr Id handle_tag=(Id(1)<<63)|1;
 bool linked_rank(Id id) {return (id&handle_tag)==handle_tag;}
 unsigned rank_of(Id id) {return unsigned((id^handle_tag)/(2*bins));}
-size_t person_bin(Id id) {return (linked_rank(id)?id/2:HashId{}(id))%bins;}
+size_t person_bin(Id id) {return (linked_rank(id)?id/2:person_digits(id))%bins;}
 struct Links {
-    IdTable<0> table;
-    vector<unsigned> parent, size;
+    FlatIds aliases;
+    vector<std::pair<Id,Id>> edges;
+    vector<unsigned> parent,size;
     vector<Id> canonical;
+    struct Alias {Id key,person;};
+    vector<Alias> resolved;
     std::array<vector<Id>,bins> people;
     Symbols& symbols;
-    Links(size_t estimate,Symbols& symbols):table(estimate),symbols(symbols) {}
-    unsigned index(Text name) {
-        Id id=symbols.encode(name);
-        unsigned i=unsigned(table.get_or_insert(id,canonical.size()));
-        if (i==canonical.size()) {
-            canonical.push_back(id);
-            parent.push_back(i);
-            size.push_back(1);
-        }
-        return i;
-    }
+    Links(size_t estimate,Symbols& symbols):symbols(symbols) {edges.reserve(estimate);}
+    void join(Text a,Text b) {edges.emplace_back(symbols.encode(a),symbols.encode(b));}
     unsigned root(unsigned i) {
         while (i!=parent[i]) i=parent[i]=parent[parent[i]];
         return i;
@@ -376,8 +383,8 @@ struct Links {
         return __builtin_bswap64(key);
 #endif
     }
-    void join(Text a,Text b) {
-        unsigned i=root(index(a)),j=root(index(b));
+    void unite(Id a,Id b) {
+        unsigned i=root(aliases.find(a)),j=root(aliases.find(b));
         if (i==j) return;
         if (size[i]<size[j]) std::swap(i,j);
         parent[j]=i;
@@ -392,23 +399,42 @@ struct Links {
         }
     }
     void finish() {
+        vector<Id> endpoints;
+        endpoints.reserve(2*edges.size());
+        for (auto [a,b]:edges) {endpoints.push_back(a); endpoints.push_back(b);}
+        aliases.build(std::move(endpoints));
+        canonical=aliases.keys;
+        parent.resize(canonical.size());
+        std::iota(parent.begin(),parent.end(),0u);
+        size.assign(parent.size(),1);
+        for (auto [a,b]:edges) unite(a,b);
+        decltype(edges)().swap(edges);
         vector<Id> handles(parent.size(),missing_id);
-        table.transform_values([&](Id index) {
+        resolved.resize(parent.size());
+        for (size_t index=0;index<parent.size();++index) {
             unsigned r=root(unsigned(index));
             auto& handle=handles[r];
             if (handle==missing_id) {
-                size_t b=HashId{}(canonical[r])%bins;
+                size_t b=person_digits(canonical[r])%bins;
                 handle=handle_tag|((people[b].size()*bins+b)*2);
                 people[b].push_back(canonical[r]);
             }
-            return handle;
-        });
+            resolved[index]={aliases.keys[index],handle};
+        }
         vector<unsigned>().swap(parent);
         vector<unsigned>().swap(size);
         vector<Id>().swap(canonical);
+        vector<Id>().swap(aliases.keys);
     }
     Id person(Id id) const {
-        return table.find(id,id);
+        size_t b=aliases.bucket(id);
+        auto begin=resolved.begin()+aliases.offsets[b],end=resolved.begin()+aliases.offsets[b+1];
+        if (end-begin<=8) {
+            for (auto it=begin;it!=end;++it) if (it->key==id) return it->person;
+            return id;
+        }
+        auto it=std::lower_bound(begin,end,id,[](const Alias& a,Id key){return a.key<key;});
+        return it!=end && it->key==id ? it->person : id;
     }
 };
 struct TimedEvent { I64 ts; int price,category; };
@@ -430,10 +456,60 @@ template<class Encoding> struct EventRecord {
     Id user=missing_id;
     decltype(Encoding::pack(0,TimedEvent{})) payload{};
 };
-template<class Event> struct DedupRecord {Id id; I64 ingest; Event event;};
+template<class Key, class Event> struct DedupRecord {Key id; I64 ingest; Event event;};
 struct Click {Id user; I64 ts; Text id; int campaign;};
 template<class T> using Buckets = std::array<vector<T>,bins>;
-size_t bucket(Id id) {return HashId{}(id)%bins;}
+// Generated IDs are canonical base-36 strings. Other spellings, including
+// leading zeroes, are grouped by their original bytes.
+Id event_number(Text text) {
+    if (text.size()<2 || text.size()>9 || text[0]!='e' ||
+        (text.size()>2 && text[1]=='0')) return missing_id;
+    static constexpr auto digits=[] {
+        std::array<unsigned char,256> table{};
+        table.fill(255);
+        for (int i=0;i<10;++i) table['0'+i]=i;
+        for (int i=0;i<26;++i) table['a'+i]=10+i;
+        return table;
+    }();
+    // An eight-digit suffix can be read as four base-36 pairs.
+    if constexpr (std::endian::native==std::endian::little) {
+        if (text.size()==9) {
+            static constexpr auto pairs=[] {
+                std::array<uint16_t,65536> result{};
+                result.fill(UINT16_MAX);
+                for (unsigned a='0';a<='z';++a) for (unsigned b='0';b<='z';++b)
+                    if (digits[a]!=255 && digits[b]!=255)
+                        result[a+256*b]=uint16_t(36*digits[a]+digits[b]);
+                return result;
+            }();
+            std::array<uint16_t,4> words;
+            std::memcpy(words.data(),text.data()+1,8);
+            Id a=pairs[words[0]],b=pairs[words[1]],c=pairs[words[2]],d=pairs[words[3]];
+            if ((a|b|c|d)&0x8000) return missing_id;
+            return (a*1296+b)*(1296*1296)+(c*1296+d);
+        }
+    }
+    Id number=0;
+    for (unsigned char c:text.substr(1)) {
+        auto digit=digits[c];
+        if (digit==255) return missing_id;
+        number=number*36+digit;
+    }
+    return number;
+}
+
+template<class Record, class Emit>
+void emit_winners(vector<Record>& rows,Emit emit) {
+    for (size_t i=0;i<rows.size();) {
+        auto* winner=&rows[i++];
+        while (i<rows.size() && rows[i].id==winner->id) {
+            if (rows[i].ingest<winner->ingest) winner=&rows[i];
+            ++i;
+        }
+        emit(winner->event);
+    }
+}
+
 // Estimate rows from the local CSV density. Reserve once per partition;
 // this affects allocation only, so long fields and skew can grow normally.
 template<class T> void reserve_chunks(Buckets<T>& parts,Text chunk) {
@@ -441,7 +517,7 @@ template<class T> void reserve_chunks(Buckets<T>& parts,Text chunk) {
     if (chunk.size()<sample_bytes) return;
     auto sample=chunk.substr(0,sample_bytes);
     size_t lines=std::count(sample.begin(),sample.end(),'\n');
-    auto average=std::min(chunk.size(),size_t(1024*1024))*lines/(sample_bytes*bins);
+    auto average=std::min(chunk.size(),chunk_bytes)*lines/(sample_bytes*bins);
     if (average) for (auto& part:parts) part.reserve(average+average/4+4);
 }
 // CSV values borrow these bytes through the last Parquet write.
@@ -471,7 +547,7 @@ struct InputFile {
 struct Chunk {
     Text file;
     size_t offset;
-    static constexpr size_t target=1024*1024;
+    static constexpr size_t target=chunk_bytes;
     // Both neighbours compute the same newline boundary. Defer the first
     // page faults until a worker actually consumes this region.
     Text rows() const {
@@ -501,22 +577,40 @@ struct Input {
 struct Counts {
     I64 sessions{}, purchasing{}, revenue{}, assists{};
 };
+struct DayIndex {
+    int first;
+    vector<unsigned> index;
+    DayIndex(I64 start,I64 end):first(int(floor<days>(milliseconds(start)).count())) {
+        if (end>start) index.resize(size_t(floor<days>(milliseconds(end-1)).count()-first+1));
+    }
+    using Rows=vector<std::pair<int,vector<Counts>>>;
+    vector<Counts>& get(Rows& rows,int day,size_t campaigns) {
+        auto& pos=index[size_t(day-first)];
+        if (!pos) {
+            rows.emplace_back(day,vector<Counts>(campaigns));
+            pos=unsigned(rows.size());
+        }
+        return rows[pos-1].second;
+    }
+};
 struct Results {
     vector<UserRow> users;
-    std::unordered_map<int,vector<Counts>> days;
+    DayIndex::Rows days;
 };
 struct People {
-    IdTable<std::countr_zero(unsigned(bins))> ids;
+    static constexpr unsigned missing=UINT32_MAX;
+    FlatIds unlinked{std::countr_zero(unsigned(bins))};
     vector<Id> names;
-    People(size_t estimate,vector<Id> known):ids(estimate),names(std::move(known)) {}
-    unsigned intern(Id name) {
-        if (linked_rank(name)) return rank_of(name);
-        unsigned rank=unsigned(ids.get_or_insert(name,names.size()));
-        if (rank==names.size()) names.push_back(name);
-        return rank;
+    unsigned known;
+    People(vector<Id> linked,vector<Id> others):names(std::move(linked)),known(unsigned(names.size())) {
+        unlinked.build(std::move(others));
+        names.insert(names.end(),unlinked.keys.begin(),unlinked.keys.end());
     }
-    static constexpr unsigned missing=std::numeric_limits<unsigned>::max();
-    unsigned find(Id name) const { return linked_rank(name)?rank_of(name):unsigned(ids.find(name,missing)); }
+    unsigned find(Id name) const {
+        if (linked_rank(name)) return rank_of(name);
+        unsigned i=unlinked.find(name);
+        return i==missing ? missing : known+i;
+    }
 };
 struct TimedClick { I64 ts; Text id; int campaign; };
 template<class T> struct Timeline {
@@ -537,7 +631,6 @@ Timeline<T> group_by_person(vector<Buckets<Row>>& sources,size_t bin,size_t know
         unsigned id=identify(row.user);
         owners.push_back(id);
         if (id==People::missing) continue;
-        if (id==counts.size()) counts.push_back(0);
         ++counts[id];
     }
     Timeline<T> result;
@@ -555,9 +648,10 @@ Timeline<T> group_by_person(vector<Buckets<Row>>& sources,size_t bin,size_t know
     }
     return result;
 }
-void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_groups,
+template<class Encoding,class Data>
+void aggregate(I64 window_start,Timeline<Data>& event_groups, Timeline<TimedClick>& click_groups,
                const vector<Text>& people, const vector<Text>& category_names,
-               size_t campaign_count, Results& out) {
+               size_t campaign_count, DayIndex day_index, Results& out) {
     auto& events=event_groups.rows;
     auto& clicks=click_groups.rows;
     vector<int> counts(campaign_count), position(campaign_count), active;
@@ -568,8 +662,8 @@ void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_g
         size_t e=event_groups.offsets[person],event_end=event_groups.offsets[person+1];
         if (e==event_end) continue;
         size_t c=click_groups.offsets[person],click_end=click_groups.offsets[person+1];
-        std::sort(events.begin()+e,events.begin()+event_end,[](auto& a,auto& b){
-            return a.ts<b.ts;
+        std::sort(events.begin()+e,events.begin()+event_end,[window_start](auto& a,auto& b){
+            return Encoding::unpack(window_start,a).ts<Encoding::unpack(window_start,b).ts;
         });
         // The last eligible click must win the lexicographically smallest ID tie.
         std::sort(clicks.begin()+c,clicks.begin()+click_end,[](auto& a,auto& b){
@@ -580,7 +674,7 @@ void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_g
         active.clear();
         I64 best=0;
         while (e<event_end) {
-            I64 start=events[e].ts,prev=start, revenue=0;
+            I64 start=Encoding::unpack(window_start,events[e]).ts,prev=start, revenue=0;
             int day=int(floor<days>(milliseconds(start)).count());
             if (out.users.empty() || out.users.back().user!=user || out.users.back().day!=day) {
                 out.users.push_back({user,day});
@@ -591,7 +685,7 @@ void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_g
             auto& u=out.users.back();
             ++u.sessions;
             do {
-                auto& event=events[e++];
+                auto event=Encoding::unpack(window_start,events[e++]);
                 prev=event.ts;
                 ++u.events;
                 revenue+=event.price;
@@ -603,7 +697,7 @@ void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_g
                         u.top=category_names[event.category];
                     }
                 }
-            } while (e<event_end && events[e].ts-prev<=1800000);
+            } while (e<event_end && Encoding::unpack(window_start,events[e]).ts-prev<=1800000);
             u.revenue+=revenue;
             while (c<click_end && clicks[c].ts<=start) {
                 int id=clicks[c++].campaign;
@@ -621,8 +715,7 @@ void aggregate(Timeline<TimedEvent>& event_groups, Timeline<TimedClick>& click_g
                     active.pop_back();
                 }
             }
-            auto& daily=out.days[day];
-            if (daily.empty()) daily.resize(campaign_count);
+            auto& daily=day_index.get(out.days,day,campaign_count);
             int credit=left<c?clicks[c-1].campaign:0;
             auto& credited=daily[credit];
             ++credited.sessions;
@@ -686,13 +779,15 @@ void run(fs::path data,fs::path output) {
     Input links(data/"links");
     size_t link_bytes=0;
     for (auto& file:links.files) link_bytes+=file.view().size();
-    Symbols users('u'),event_ids('e');
+    Symbols users('u');
     Links identity(link_bytes/20,users);
     Input events(data/"events"),clicks(data/"clicks");
     mark("map inputs and load dimensions");
     auto process=[&]<class Encoding>() {
         using Event=EventRecord<Encoding>;
-        using Record=DedupRecord<Event>;
+        using Record=DedupRecord<Id,Event>;
+        using Other=DedupRecord<Text,Event>;
+        vector<vector<Other>> unusual(events.chunks.size());
         vector<Buckets<Record>> raw(events.chunks.size());
         // Parsing needs the raw user ID only. Build the identity graph on one
         // of the same eight workers, then resolve surviving IDs after dedup.
@@ -711,8 +806,10 @@ void run(fs::path data,fs::path output) {
                 if (f[0].empty()) return;
                 I64 ingest=ingest_time(f[3]);
                 // Keep even an invalid earliest copy in the deduplication contest.
-                Id id=event_ids.encode(f[0]);
-                auto& r=raw[i][bucket(id)].emplace_back(Record{id,ingest,{}});
+                Id id=event_number(f[0]);
+                Event& event=id==missing_id
+                    ? unusual[i].emplace_back(Other{f[0],ingest,{}}).event
+                    : raw[i][id%bins].emplace_back(Record{id,ingest,{}}).event;
                 if (f[1].empty() || f[5].empty()) return;
                 I64 t=timestamp(f[2]);
                 if (t<start || t>=end || ingest>t+day_ms) return;
@@ -723,62 +820,49 @@ void run(fs::path data,fs::path output) {
                     price=int(value);
                     category=std::max(0,product_categories.find(f[5]));
                 } else if (f[4]!="view" && f[4]!="cart") return;
-                r.event={users.encode(f[1]),Encoding::pack(start,{t,price,category})};
+                event={users.encode(f[1]),Encoding::pack(start,{t,price,category})};
             });
         });
         mark("resolve links and parse event CSV");
-        vector<Buckets<Event>> parsed(bins);
-        parallel(bins,[&](size_t b){
-            size_t n=0;
-            for (auto& parts:raw) n+=parts[b].size();
-            struct Flags {uint64_t seen=0,repeated=0;};
-            size_t bits=std::bit_ceil(std::max<size_t>(64,4*n));
-            vector<Flags> flags(bits/64);
-            size_t revisits=0;
-            for (auto& parts:raw) for (const auto& row:parts[b]) {
-                size_t h=(HashId{}(row.id)/bins)&(bits-1);
-                uint64_t bit=uint64_t(1)<<(h%64);
-                auto& word=flags[h/64];
-                auto seen=word.seen&bit;
-                word.repeated|=seen;
-                word.seen|=bit;
-                revisits+=seen!=0;
-            }
-            for (auto& part:parsed[b]) part.reserve(n/bins+n/(bins*8));
-            auto emit=[&](Event ev) {
-                if (ev.user==missing_id) return;
-                ev.user=identity.person(ev.user);
-                parsed[b][person_bin(ev.user)].push_back(ev);
+        vector<Buckets<Event>> parsed(bins+1);
+        auto deduplicate=[&](size_t b){
+            auto emit=[&](Event event) {
+                if (event.user==missing_id) return;
+                event.user=identity.person(event.user);
+                parsed[b][person_bin(event.user)].push_back(event);
             };
-            // A singleton slot proves uniqueness. For a slot containing k>=2
-            // rows, k <= 2*(k-1), so two times revisits bounds the delayed rows.
-            size_t capacity=std::bit_ceil(3*revisits+1);
-            vector<unsigned> table(capacity,UINT32_MAX);
-            vector<Record> delayed;
-            delayed.reserve(2*revisits);
-            for (auto& parts:raw) for (const auto& row:parts[b]) {
-                size_t hash=HashId{}(row.id)/bins;
-                size_t h=hash&(bits-1);
-                if (!(flags[h/64].repeated & (uint64_t(1)<<(h%64)))) {
-                    emit(row.event);
-                    continue;
-                }
-                size_t pos=hash&(capacity-1);
-                while (table[pos]!=UINT32_MAX && delayed[table[pos]].id!=row.id)
-                    pos=(pos+1)&(capacity-1);
-                if (table[pos]==UINT32_MAX) {
-                    table[pos]=unsigned(delayed.size());
-                    delayed.push_back(row);
-                } else if (row.ingest<delayed[table[pos]].ingest) {
-                    delayed[table[pos]]=row;
-                }
+            if (b==bins) {
+                vector<Other> rows;
+                for (auto& part:unusual) rows.insert(rows.end(),part.begin(),part.end());
+                std::sort(rows.begin(),rows.end(),[](auto& a,auto& b){return a.id<b.id;});
+                emit_winners(rows,emit);
+                return;
             }
-            for (const auto& row:delayed) emit(row.event);
-            for (auto& parts:raw) vector<Record>().swap(parts[b]);
-        });
-        mark("deduplicate and partition by person");
+            size_t n=0;
+            for (const auto& parts:raw) n+=parts[b].size();
+            for (auto& part:parsed[b]) part.reserve(n/bins);
+            if (!n) return;
+            // A one-byte counter per low-digit address is sufficient. Once
+            // the count reaches two, send those full IDs to the exact sort.
+            const size_t mask=std::bit_ceil(8*n)-1;
+            vector<unsigned char> counts(mask+1);
+            for (const auto& parts:raw) for (const auto& row:parts[b]) {
+                auto& count=counts[(row.id/bins)&mask];
+                if (count<2) ++count;
+            }
+            vector<Record> repeated;
+            for (auto& parts:raw) {
+                for (const auto& row:parts[b]) {
+                    if (counts[(row.id/bins)&mask]==1) emit(row.event);
+                    else repeated.push_back(row);
+                }
+                vector<Record>().swap(parts[b]);
+            }
+            std::sort(repeated.begin(),repeated.end(),[](auto& a,auto& b){return a.id<b.id;});
+            emit_winners(repeated,emit);
+        };
         vector<Buckets<Click>> ads(clicks.chunks.size());
-        parallel(clicks.chunks.size(),[&](size_t i){
+        auto parse_clicks=[&](size_t i){
             auto chunk=clicks.chunks[i].rows();
             reserve_chunks(ads[i],chunk);
             records<4>(chunk,[&](Text,auto f){
@@ -789,33 +873,38 @@ void run(fs::path data,fs::path output) {
                 auto user=identity.person(users.encode(f[1]));
                 ads[i][person_bin(user)].push_back({user,t,f[0],campaign});
             });
+        };
+        parallel(parsed.size()+ads.size(),[&](size_t task){
+            if (task<ads.size()) parse_clicks(task);
+            else deduplicate(task-ads.size());
         });
-        mark("prepare clicks");
+        mark("deduplicate events, prepare clicks and partition by person");
         fs::create_directories(output/"user_daily");
         fs::create_directories(output/"campaign_daily");
         vector<Results> results(bins);
         parallel(bins,[&](size_t b){
-            size_t event_count=0;
-            for (auto& part:parsed) event_count+=part[b].size();
-            People people(event_count/64,std::move(identity.people[b]));
-            auto ev=group_by_person<TimedEvent>(parsed,b,people.names.size(),[&](Id u){return people.intern(u);},
-                [start](const Event& e){return Encoding::unpack(start,e.payload);});
+            vector<Id> unlinked;
+            for (auto& part:parsed) for (const auto& event:part[b])
+                if (!linked_rank(event.user)) unlinked.push_back(event.user);
+            People people(std::move(identity.people[b]),std::move(unlinked));
+            auto ev=group_by_person<decltype(Event{}.payload)>(parsed,b,people.names.size(),[&](Id u){return people.find(u);},
+                [](const Event& e){return e.payload;});
             auto ad=group_by_person<TimedClick>(ads,b,people.names.size(),[&](Id u){return people.find(u);},
                 [](const Click& c){return TimedClick{c.ts,c.id,c.campaign};});
             vector<std::array<char,9>> storage(people.names.size());
             vector<Text> names;
             names.reserve(storage.size());
             for (size_t i=0;i<storage.size();++i) names.push_back(users.decode(people.names[i],storage[i]));
-            aggregate(ev,ad,names,category_names,campaign_names.size(),results[b]);
+            aggregate<Encoding>(start,ev,ad,names,category_names,campaign_names.size(),DayIndex(start,end),results[b]);
             auto& rows=results[b].users;
             if (!rows.empty() || b==0) save(output/"user_daily"/(std::to_string(b)+".parquet"),rows);
             vector<UserRow>().swap(rows);
         });
         mark("sort, aggregate and write user tables");
-        std::unordered_map<int,vector<Counts>> merged;
+        DayIndex day_index(start,end);
+        DayIndex::Rows merged;
         for (auto& part:results) for (auto& [day,rows]:part.days) {
-            auto& daily=merged[day];
-            if (daily.empty()) daily.resize(campaign_names.size());
+            auto& daily=day_index.get(merged,day,campaign_names.size());
             for (size_t i=0;i<rows.size();++i) {
                 auto& m=daily[i];
                 m.sessions+=rows[i].sessions;
